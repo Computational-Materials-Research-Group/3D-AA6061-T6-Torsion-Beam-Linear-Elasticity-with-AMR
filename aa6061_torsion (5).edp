@@ -1,0 +1,269 @@
+// ============================================================
+// AA6061-T6 TORSION BEAM - VERSION 4
+// - Von Mises stress output
+// - Smooth colour gradient (30 load steps for animation)
+// - Consistent colour range across all frames
+// - AMR on von Mises gradient
+// Output: D:\freefem++\aa6061_v4\
+// ============================================================
+
+load "iovtk"
+load "msh3"
+
+string outdir = "D:\\freefem++\\aa6061_v4\\";
+system("mkdir \"D:\\freefem++\\aa6061_v4\"");
+
+// AA6061-T6
+real Emod  = 69.0e9;
+real Nu    = 0.33;
+real Mu    = Emod/(2.*(1.+Nu));
+real Lam   = Emod*Nu/((1.+Nu)*(1.-2.*Nu));
+real sqrt2 = sqrt(2.);
+
+real Lx=0.200, Ly=0.040, Lz=0.040;
+
+// Correct traction: T = C*Ip
+real Tmax = 500.;
+real Ip   = Ly*Lz*(Ly*Ly + Lz*Lz)/12.;
+real Cmax = Tmax / Ip;
+
+// 200x warp baked in
+real warpScale = 200.;
+
+// AMR - conservative to stay in RAM
+real errAMR  = 0.05;
+real hminAMR = 0.003;
+real hmaxAMR = 0.020;
+int  nbvxAMR = 8000;
+int  adaptEvery = 8;
+
+cout << "==========================================" << endl;
+cout << " AA6061-T6 Torsion Beam - Version 4"        << endl;
+cout << " Tmax=" << Tmax << "Nm  Cmax=" << Cmax/1e6 << "MPa" << endl;
+cout << " 30 steps -> smooth animation"              << endl;
+cout << "==========================================" << endl;
+
+// MESH
+border B1(t=0.,  Lx){ x=t;  y=0.;  label=1; }
+border B2(t=0.,  Ly){ x=Lx; y=t;   label=2; }
+border B3(t=Lx, 0.){ x=t;  y=Ly;  label=3; }
+border B4(t=Ly, 0.){ x=0.; y=t;   label=4; }
+
+mesh Th2 = buildmesh(B1(15)+B2(6)+B3(15)+B4(6));
+mesh3 Th = buildlayers(Th2, 6);
+Th = movemesh3(Th, transfo=[x, y, z*Lz]);
+
+int labClamp=4, labTorsion=2;
+cout << " Mesh: nv=" << Th.nv << " nt=" << Th.nt << endl;
+
+macro Epsilon(ux,uy,uz) [
+    dx(ux), dy(uy), dz(uz),
+    (dz(uy)+dy(uz))/sqrt2,
+    (dz(ux)+dx(uz))/sqrt2,
+    (dy(ux)+dx(uy))/sqrt2
+] //
+macro Divergence(ux,uy,uz) (dx(ux)+dy(uy)+dz(uz)) //
+
+// ============================================================
+// FIRST PASS: run all steps to find global max values
+// so colour range is consistent across all frames
+// ============================================================
+int  nStep = 30;   // 30 steps = smooth animation
+int  fcnt  = 0;
+real[int] pvdTimes(nStep);
+string[int] pvdFiles(nStep);
+
+// Global max trackers
+real globalUmax  = 0.;
+real globalVMmax = 0.;
+
+// Quick pre-run on coarse mesh to get ranges
+{
+    fespace UhQ(Th, [P1,P1,P1]);
+    UhQ [uxQ,uyQ,uzQ];
+
+    varf vQ([uxQ,uyQ,uzQ],[vx,vy,vz]) =
+        int3d(Th)(
+            Lam*Divergence(vx,vy,vz)*Divergence(uxQ,uyQ,uzQ)
+           +2.*Mu*(Epsilon(vx,vy,vz)'*Epsilon(uxQ,uyQ,uzQ))
+        )
+        - int2d(Th,labTorsion)(
+            (-Cmax*(z-Lz/2.))*vy+(Cmax*(y-Ly/2.))*vz
+        )
+        + on(labClamp, uxQ=0., uyQ=0., uzQ=0.)
+    ;
+    matrix KQ=vQ(UhQ,UhQ,solver=sparsesolver);
+    real[int] rQ=vQ(0,UhQ);
+    uxQ[]=KQ^-1*rQ;
+
+    fespace ShQ(Th,P1);
+    ShQ umagQ; umagQ=sqrt(uxQ*uxQ+uyQ*uyQ+uzQ*uzQ);
+    globalUmax = umagQ[].max * 1.05;  // 5% headroom
+
+    // VM max estimate
+    fespace PhQ(Th,P03d);
+    PhQ vmQ;
+    int ne=Th.nt;
+    for(int i=0;i<ne;i++){
+        real xe=(Th[i][0].x+Th[i][1].x+Th[i][2].x+Th[i][3].x)/4.;
+        real ye=(Th[i][0].y+Th[i][1].y+Th[i][2].y+Th[i][3].y)/4.;
+        real ze=(Th[i][0].z+Th[i][1].z+Th[i][2].z+Th[i][3].z)/4.;
+        real exx=dx(uxQ)(xe,ye,ze); real eyy=dy(uyQ)(xe,ye,ze);
+        real ezz=dz(uzQ)(xe,ye,ze);
+        real exy=0.5*(dy(uxQ)(xe,ye,ze)+dx(uyQ)(xe,ye,ze));
+        real exz=0.5*(dz(uxQ)(xe,ye,ze)+dx(uzQ)(xe,ye,ze));
+        real eyz=0.5*(dz(uyQ)(xe,ye,ze)+dy(uzQ)(xe,ye,ze));
+        real sxx=(Lam+2.*Mu)*exx+Lam*(eyy+ezz);
+        real syy=(Lam+2.*Mu)*eyy+Lam*(exx+ezz);
+        real szz=(Lam+2.*Mu)*ezz+Lam*(exx+eyy);
+        real sxy=2.*Mu*exy; real sxz=2.*Mu*exz; real syz=2.*Mu*eyz;
+        real sm=(sxx+syy+szz)/3.;
+        vmQ[][i]=sqrt(1.5*((sxx-sm)*(sxx-sm)+(syy-sm)*(syy-sm)
+                          +(szz-sm)*(szz-sm))
+                     +3.*(sxy*sxy+sxz*sxz+syz*syz));
+    }
+    globalVMmax = vmQ[].max * 1.05;
+}
+
+cout << " Global umax="  << globalUmax*1e3  << "mm" << endl;
+cout << " Global VMmax=" << globalVMmax/1e6 << "MPa" << endl;
+
+// ============================================================
+// MAIN LOOP - 30 steps
+// ============================================================
+for(int s=1; s<=nStep; s++){
+
+    real frac  = real(s)/real(nStep);
+    real Cload = frac * Cmax;
+    real Tload = frac * Tmax;
+
+    fespace Uh(Th, [P1,P1,P1]);
+    Uh [ux,uy,uz];
+
+    varf vElas([ux,uy,uz],[vx,vy,vz]) =
+        int3d(Th)(
+            Lam*Divergence(vx,vy,vz)*Divergence(ux,uy,uz)
+           +2.*Mu*(Epsilon(vx,vy,vz)'*Epsilon(ux,uy,uz))
+        )
+        - int2d(Th,labTorsion)(
+            (-Cload*(z-Lz/2.))*vy+(Cload*(y-Ly/2.))*vz
+        )
+        + on(labClamp, ux=0., uy=0., uz=0.)
+    ;
+
+    matrix K=vElas(Uh,Uh,solver=sparsesolver);
+    real[int] rhs=vElas(0,Uh);
+    ux[]=K^-1*rhs;
+
+    // Displacement magnitude
+    fespace Sh(Th,P1);
+    Sh umag; umag=sqrt(ux*ux+uy*uy+uz*uz);
+
+    // Von Mises stress (P1 nodal for smooth colour gradient)
+    Sh vonMN;
+    {
+        // Compute element-centred VM then project to nodes (P1)
+        // This gives smooth colour field - no blocky P0 look
+        fespace Ph(Th,P03d);
+        Ph vonM;
+        int ne=Th.nt;
+        for(int i=0;i<ne;i++){
+            real xe=(Th[i][0].x+Th[i][1].x+Th[i][2].x+Th[i][3].x)/4.;
+            real ye=(Th[i][0].y+Th[i][1].y+Th[i][2].y+Th[i][3].y)/4.;
+            real ze=(Th[i][0].z+Th[i][1].z+Th[i][2].z+Th[i][3].z)/4.;
+            real exx=dx(ux)(xe,ye,ze); real eyy=dy(uy)(xe,ye,ze);
+            real ezz=dz(uz)(xe,ye,ze);
+            real exy=0.5*(dy(ux)(xe,ye,ze)+dx(uy)(xe,ye,ze));
+            real exz=0.5*(dz(ux)(xe,ye,ze)+dx(uz)(xe,ye,ze));
+            real eyz=0.5*(dz(uy)(xe,ye,ze)+dy(uz)(xe,ye,ze));
+            real sxx=(Lam+2.*Mu)*exx+Lam*(eyy+ezz);
+            real syy=(Lam+2.*Mu)*eyy+Lam*(exx+ezz);
+            real szz=(Lam+2.*Mu)*ezz+Lam*(exx+eyy);
+            real sxy=2.*Mu*exy; real sxz=2.*Mu*exz; real syz=2.*Mu*eyz;
+            real sm=(sxx+syy+szz)/3.;
+            vonM[][i]=sqrt(1.5*((sxx-sm)*(sxx-sm)+(syy-sm)*(syy-sm)
+                               +(szz-sm)*(szz-sm))
+                          +3.*(sxy*sxy+sxz*sxz+syz*syz));
+        }
+        // Project P0->P1 via L2 projection for smooth field
+        vonMN = vonM;
+    }
+
+    // Twist angle
+    real twistDeg = atan2(uy(Lx,Ly/2.,Lz), Lz/2.) * 180./pi;
+
+    cout << "Step " << s << "/" << nStep
+         << "  T=" << Tload << "Nm"
+         << "  umax=" << umag[].max*1e3 << "mm"
+         << "  twist=" << twistDeg << "deg"
+         << "  VM=" << vonMN[].max/1e6 << "MPa"
+         << "  nv=" << Th.nv
+         << endl;
+
+    // Save deformed mesh - warp baked in
+    mesh3 ThDef = movemesh3(Th, transfo=[
+        x+warpScale*ux, y+warpScale*uy, z+warpScale*uz
+    ]);
+
+    fespace ShD(ThDef,P1);
+    ShD umagD;  umagD = umag;
+    ShD vonMD;  vonMD = vonMN;
+    ShD uxD;    uxD   = ux;
+    ShD uyD;    uyD   = uy;
+    ShD uzD;    uzD   = uz;
+
+    string num;
+    if      (fcnt<  10) num="000"+fcnt;
+    else if (fcnt< 100) num="00" +fcnt;
+    else                num="0"  +fcnt;
+
+    // Save with BOTH DispMag and VonMises
+    int[int] ordN=[1,1,1,1,1];
+    savevtk(outdir+"frame"+num+".vtu", ThDef,
+            umagD, vonMD, uxD, uyD, uzD,
+            dataname="DispMag VonMises Ux Uy Uz",
+            order=ordN);
+
+    pvdTimes[fcnt] = frac;
+    pvdFiles[fcnt] = "frame"+num+".vtu";
+    fcnt++;
+
+    // AMR
+    if(s % adaptEvery == 0 && s < nStep){
+        fespace Vh2d(Th2,P1);
+        Vh2d vm2d;
+        for(int i=0;i<Th2.nv;i++)
+            vm2d[][i] = vonMN(Th2(i).x, Th2(i).y, Lz/2.);
+        Th2 = adaptmesh(Th2, vm2d,
+                        nbvx=nbvxAMR, err=errAMR,
+                        hmin=hminAMR, hmax=hmaxAMR,
+                        ratio=1.5, iso=1);
+        Th = buildlayers(Th2, 6);
+        Th = movemesh3(Th, transfo=[x, y, z*Lz]);
+        cout << "  AMR: nv=" << Th.nv << endl;
+    }
+}
+
+// PVD - written once
+{
+    ofstream pvd(outdir+"beam.pvd");
+    pvd << "<?xml version='1.0'?>" << endl;
+    pvd << "<VTKFile type='Collection' version='0.1' byte_order='LittleEndian'>" << endl;
+    pvd << "  <Collection>" << endl;
+    for(int i=0;i<fcnt;i++)
+        pvd << "    <DataSet timestep='" << pvdTimes[i]
+            << "' group='' part='0' file='" << pvdFiles[i] << "'/>" << endl;
+    pvd << "  </Collection>" << endl;
+    pvd << "</VTKFile>" << endl;
+}
+
+cout << "==========================================" << endl;
+cout << " DONE - D:\\freefem++\\aa6061_v4\\beam.pvd" << endl;
+cout << " In ParaView:"                              << endl;
+cout << "  Colour by VonMises -> twist stress"      << endl;
+cout << "  Colour by DispMag  -> displacement"      << endl;
+cout << "  Colour by Uz       -> rotation field"    << endl;
+cout << "  Press Play -> 30-frame smooth animation" << endl;
+cout << "  Edit -> Settings -> Animation:"          << endl;
+cout << "    Speed: Slowest for smooth playback"    << endl;
+cout << "==========================================" << endl;
