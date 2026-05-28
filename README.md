@@ -1,0 +1,1 @@
+# 3D-AA6061-T6-Torsion-Beam-Linear-Elasticity-with-AMR
